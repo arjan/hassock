@@ -22,6 +22,7 @@ defmodule Hassock.Protocol do
   - `subscribe_entities` — efficient targeted entity subscription
   - `unsubscribe_events` — cancel any subscription
   - `call_service`, `get_states`, `get_services`, `ping`
+  - `lovelace/dashboards/list`, `lovelace/config` — dashboard listing and config
   """
 
   alias Hassock.{EntityState, ServiceCall}
@@ -59,13 +60,33 @@ defmodule Hassock.Protocol do
 
   @doc """
   Parse a raw JSON string from the HA WebSocket into a tagged term.
+
+  Options:
+
+    * `:raw_result?` — a 1-arity function called with a result's `id`. When
+      it returns `true`, the result is returned as `{:result, id, success,
+      result}` without shape detection. Use it for commands whose payload
+      could be mistaken for a `get_states` or `get_services` result, such as
+      a dashboard config.
   """
-  @spec parse(String.t()) :: parsed()
-  def parse(json) do
-    json
-    |> Jason.decode!()
-    |> parse_decoded()
+  @spec parse(String.t(), keyword) :: parsed()
+  def parse(json, opts \\ []) do
+    raw_result? = Keyword.get(opts, :raw_result?, fn _id -> false end)
+
+    case Jason.decode!(json) do
+      %{"type" => "result", "id" => id} = msg ->
+        if raw_result?.(id), do: parse_raw_result(msg), else: parse_decoded(msg)
+
+      msg ->
+        parse_decoded(msg)
+    end
   end
+
+  defp parse_raw_result(%{"id" => id, "success" => true} = msg),
+    do: {:result, id, true, Map.get(msg, "result")}
+
+  defp parse_raw_result(%{"id" => id} = msg),
+    do: {:result, id, false, Map.get(msg, "error")}
 
   defp parse_decoded(%{"type" => "auth_required"}), do: :auth_required
   defp parse_decoded(%{"type" => "auth_ok"}), do: :auth_ok
@@ -267,6 +288,22 @@ defmodule Hassock.Protocol do
     msg =
       if call.service_data != %{}, do: Map.put(msg, :service_data, call.service_data), else: msg
 
+    Jason.encode!(msg)
+  end
+
+  @doc "Encode a `lovelace/dashboards/list` command."
+  @spec encode_lovelace_dashboards(integer()) :: String.t()
+  def encode_lovelace_dashboards(id),
+    do: Jason.encode!(%{id: id, type: "lovelace/dashboards/list"})
+
+  @doc """
+  Encode a `lovelace/config` command. A `nil` `url_path` asks for the default
+  dashboard. `force: true` makes HA reload a YAML dashboard from disk.
+  """
+  @spec encode_lovelace_config(integer(), String.t() | nil, boolean()) :: String.t()
+  def encode_lovelace_config(id, url_path, force \\ false) do
+    msg = %{id: id, type: "lovelace/config", force: force}
+    msg = if url_path, do: Map.put(msg, :url_path, url_path), else: msg
     Jason.encode!(msg)
   end
 

@@ -186,6 +186,42 @@ defmodule Hassock.ProtocolTest do
     end
   end
 
+  describe "parse/2 — raw results" do
+    # A strategy dashboard config has the shape of a get_services result:
+    # a map whose first value is a map whose first value is a map.
+    @strategy_config %{strategy: %{options: %{areas: %{}}, type: "original-states"}}
+
+    test "shape detection misreads a strategy dashboard config as services" do
+      json = Jason.encode!(%{type: "result", id: 7, success: true, result: @strategy_config})
+      assert {:services, 7, _} = Protocol.parse(json)
+    end
+
+    test "raw_result? returns the config untouched" do
+      json = Jason.encode!(%{type: "result", id: 7, success: true, result: @strategy_config})
+
+      assert {:result, 7, true, %{"strategy" => %{"type" => "original-states"}}} =
+               Protocol.parse(json, raw_result?: &(&1 == 7))
+    end
+
+    test "raw_result? passes errors through" do
+      json =
+        Jason.encode!(%{
+          type: "result",
+          id: 8,
+          success: false,
+          error: %{code: "config_not_found", message: "No config found."}
+        })
+
+      assert {:result, 8, false, %{"code" => "config_not_found"}} =
+               Protocol.parse(json, raw_result?: fn _ -> true end)
+    end
+
+    test "raw_result? only applies to matching ids" do
+      json = Jason.encode!(%{type: "result", id: 9, success: true, result: @strategy_config})
+      assert {:services, 9, _} = Protocol.parse(json, raw_result?: &(&1 == 7))
+    end
+  end
+
   describe "parse/1 — other events" do
     test "non-state_changed event is passed through" do
       json =
@@ -236,6 +272,22 @@ defmodule Hassock.ProtocolTest do
     test "encode_get_states/1" do
       assert %{"id" => 5, "type" => "get_states"} =
                Protocol.encode_get_states(5) |> Jason.decode!()
+    end
+
+    test "encode_lovelace_dashboards/1" do
+      assert %{"id" => 5, "type" => "lovelace/dashboards/list"} =
+               Protocol.encode_lovelace_dashboards(5) |> Jason.decode!()
+    end
+
+    test "encode_lovelace_config/3 with nil url_path omits it" do
+      decoded = Protocol.encode_lovelace_config(5, nil) |> Jason.decode!()
+      assert decoded == %{"id" => 5, "type" => "lovelace/config", "force" => false}
+    end
+
+    test "encode_lovelace_config/3 with url_path and force" do
+      decoded = Protocol.encode_lovelace_config(5, "dashboard-energy", true) |> Jason.decode!()
+      assert decoded["url_path"] == "dashboard-energy"
+      assert decoded["force"] == true
     end
 
     test "encode_call_service/2 minimal" do

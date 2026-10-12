@@ -42,6 +42,10 @@ defmodule Hassock.Connection do
 
   @default_timeout 10_000
 
+  # Commands whose results skip Protocol's shape detection. A dashboard
+  # config is an arbitrary map and can look like a get_services result.
+  @raw_result_kinds [:lovelace_dashboards, :lovelace_config]
+
   # -- Public API --
 
   @doc """
@@ -136,6 +140,49 @@ defmodule Hassock.Connection do
     sync_request(conn, {:command, :get_services, :get_services}, @default_timeout)
   end
 
+  @doc """
+  List the dashboards HA stores or loads from YAML.
+
+  These are Lovelace dashboards, HA's internal name for its configurable,
+  card-based dashboards. Built-in panels such as Energy, History, and
+  Logbook are not Lovelace dashboards and are not listed.
+
+  Recent HA versions list the default dashboard as `"lovelace"`; older ones
+  and YAML setups may leave it out. `lovelace_config(conn, nil)` fetches it
+  either way.
+  """
+  @spec lovelace_dashboards(pid | atom) :: {:ok, [map]} | {:error, term}
+  def lovelace_dashboards(conn) do
+    sync_request(
+      conn,
+      {:command, :lovelace_dashboards, :lovelace_dashboards},
+      @default_timeout
+    )
+  end
+
+  @doc """
+  Fetch the config (views and cards) of one dashboard.
+
+  `url_path` is the dashboard's `url_path` from `lovelace_dashboards/1`, or
+  `nil` for the default dashboard. Options:
+
+    * `:force` — make HA reload a YAML dashboard from disk (default `false`)
+
+  An auto-generated dashboard returns `%{"strategy" => %{"type" => ...}}`
+  instead of views. A dashboard with no config at all gives an error whose
+  `"code"` is `"config_not_found"`.
+  """
+  @spec lovelace_config(pid | atom, String.t() | nil, keyword) :: {:ok, map} | {:error, term}
+  def lovelace_config(conn, url_path, opts \\ []) do
+    force = Keyword.get(opts, :force, false)
+
+    sync_request(
+      conn,
+      {:command, {:lovelace_config, url_path, force}, :lovelace_config},
+      @default_timeout
+    )
+  end
+
   @doc "True if authenticated and the underlying socket is connected."
   @spec connected?(pid | atom) :: boolean
   def connected?(conn) do
@@ -161,10 +208,17 @@ defmodule Hassock.Connection do
 
   @impl true
   def handle_frame({:text, json}, state) do
-    json |> Protocol.parse() |> route(state)
+    json |> Protocol.parse(raw_result?: &raw_result?(state, &1)) |> route(state)
   end
 
   def handle_frame(_frame, state), do: {:ok, state}
+
+  defp raw_result?(state, id) do
+    case Map.get(state.pending, id) do
+      {_ref, kind} -> kind in @raw_result_kinds
+      nil -> false
+    end
+  end
 
   defp route(:auth_required, state) do
     {:reply, {:text, Protocol.encode_auth(state.config.token)}, state}
@@ -290,6 +344,10 @@ defmodule Hassock.Connection do
 
   defp encode_command(id, :get_states), do: Protocol.encode_get_states(id)
   defp encode_command(id, :get_services), do: Protocol.encode_get_services(id)
+  defp encode_command(id, :lovelace_dashboards), do: Protocol.encode_lovelace_dashboards(id)
+
+  defp encode_command(id, {:lovelace_config, url_path, force}),
+    do: Protocol.encode_lovelace_config(id, url_path, force)
 
   defp format_result(_kind, _id, false, error), do: {:error, error}
   defp format_result(:subscribe, id, true, _), do: {:ok, id}

@@ -36,4 +36,55 @@ defmodule Hassock.ConnectionTest do
       assert monitors_of(controller) == 1
     end
   end
+
+  describe "lovelace results" do
+    # Calls handle_frame/2 directly; the pending entry's reply target is an
+    # alias of the test process, so the reply lands in its mailbox.
+    defp pending_state(kind) do
+      ref = :erlang.alias()
+      {ref, %State{authenticated: true, pending: %{7 => {ref, kind}}, next_id: 8}}
+    end
+
+    defp services_shaped_result(id) do
+      Jason.encode!(%{
+        type: "result",
+        id: id,
+        success: true,
+        result: %{strategy: %{options: %{areas: %{}}, type: "original-states"}}
+      })
+    end
+
+    test "a services-shaped dashboard config reaches the caller unchanged" do
+      {ref, state} = pending_state(:lovelace_config)
+
+      assert {:ok, %State{pending: pending}} =
+               Connection.handle_frame({:text, services_shaped_result(7)}, state)
+
+      assert pending == %{}
+      assert_received {:hassock_response, ^ref, {:ok, %{"strategy" => _}}}
+    end
+
+    test "get_services keeps its shape detection" do
+      {ref, state} = pending_state(:get_services)
+      Connection.handle_frame({:text, services_shaped_result(7)}, state)
+      assert_received {:hassock_response, ^ref, {:ok, %{"strategy" => ["options", "type"]}}}
+    end
+
+    test "a dashboard list is returned as maps" do
+      {ref, state} = pending_state(:lovelace_dashboards)
+
+      json =
+        Jason.encode!(%{
+          type: "result",
+          id: 7,
+          success: true,
+          result: [%{id: "dashboard_energy", url_path: "dashboard-energy", mode: "storage"}]
+        })
+
+      Connection.handle_frame({:text, json}, state)
+
+      assert_received {:hassock_response, ^ref,
+                       {:ok, [%{"url_path" => "dashboard-energy", "mode" => "storage"}]}}
+    end
+  end
 end
