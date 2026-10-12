@@ -87,4 +87,96 @@ defmodule Hassock.ConnectionTest do
                        {:ok, [%{"url_path" => "dashboard-energy", "mode" => "storage"}]}}
     end
   end
+
+  describe "template subscriptions" do
+    defp frame(map), do: {:text, Jason.encode!(map)}
+
+    defp subscribed_state do
+      ref = :erlang.alias()
+
+      state = %State{
+        authenticated: true,
+        controlling_pid: self(),
+        pending: %{4 => {ref, :subscribe_template}},
+        next_id: 5
+      }
+
+      {:ok, state} =
+        Connection.handle_frame(
+          frame(%{type: "result", id: 4, success: true, result: nil}),
+          state
+        )
+
+      assert_received {:hassock_response, ^ref, {:ok, 4}}
+      state
+    end
+
+    test "a successful subscribe tracks the id and routes its events" do
+      state = subscribed_state()
+      assert MapSet.member?(state.templates, 4)
+
+      event = frame(%{type: "event", id: 4, event: %{result: "Aan", listeners: %{}}})
+      Connection.handle_frame(event, state)
+
+      assert_received {:hassock, _, {:event, {:template, 4, %{result: "Aan"}}}}
+    end
+
+    test "an error event before the subscribe result is still a template event" do
+      ref = :erlang.alias()
+
+      state = %State{
+        authenticated: true,
+        controlling_pid: self(),
+        pending: %{4 => {ref, :subscribe_template}}
+      }
+
+      event = frame(%{type: "event", id: 4, event: %{error: "boom", level: "WARNING"}})
+      Connection.handle_frame(event, state)
+
+      assert_received {:hassock, _, {:event, {:template, 4, %{error: "boom", level: "WARNING"}}}}
+    end
+
+    test "a failed subscribe is not tracked" do
+      ref = :erlang.alias()
+      state = %State{authenticated: true, pending: %{4 => {ref, :subscribe_template}}}
+
+      result =
+        frame(%{
+          type: "result",
+          id: 4,
+          success: false,
+          error: %{code: "template_error", message: "bad"}
+        })
+
+      {:ok, state} = Connection.handle_frame(result, state)
+
+      assert MapSet.size(state.templates) == 0
+      assert_received {:hassock_response, ^ref, {:error, %{"code" => "template_error"}}}
+    end
+
+    test "unsubscribing stops tracking the id" do
+      state = subscribed_state()
+      ref = :erlang.alias()
+      state = %{state | pending: %{5 => {ref, {:unsubscribe, 4}}}}
+
+      {:ok, state} =
+        Connection.handle_frame(
+          frame(%{type: "result", id: 5, success: true, result: nil}),
+          state
+        )
+
+      assert_received {:hassock_response, ^ref, :ok}
+      refute MapSet.member?(state.templates, 4)
+    end
+
+    test "a disconnect forgets template subscriptions" do
+      state = subscribed_state()
+
+      assert {:reconnect, %State{templates: templates}} =
+               Connection.handle_disconnect(%{reason: :closed}, state)
+
+      assert MapSet.size(templates) == 0
+      assert_received {:hassock, _, {:disconnected, :closed}}
+    end
+  end
 end

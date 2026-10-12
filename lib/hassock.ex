@@ -52,6 +52,9 @@ defmodule Hassock do
   @doc "Subscribe to a non-entity HA event type."
   defdelegate subscribe_events(conn, event_type), to: Connection
 
+  @doc "Subscribe to a rendered template; see `Hassock.Connection.subscribe_template/3`."
+  defdelegate subscribe_template(conn, template, opts \\ []), to: Connection
+
   @doc "Cancel a subscription."
   defdelegate unsubscribe_events(conn, subscription_id), to: Connection
 

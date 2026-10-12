@@ -222,6 +222,37 @@ defmodule Hassock.ProtocolTest do
     end
   end
 
+  describe "parse/2 — template events" do
+    defp template_event(id, event),
+      do: Jason.encode!(%{type: "event", id: id, event: event})
+
+    test "a render result" do
+      json =
+        template_event(3, %{result: "💻 **Aan** sinds 14:05", listeners: %{entities: ["a.b"]}})
+
+      assert {:template, 3,
+              %{result: "💻 **Aan** sinds 14:05", listeners: %{"entities" => ["a.b"]}}} =
+               Protocol.parse(json, template_event?: &(&1 == 3))
+    end
+
+    test "a non-string result keeps its type" do
+      json = template_event(3, %{result: 21.5, listeners: %{}})
+      assert {:template, 3, %{result: 21.5}} = Protocol.parse(json, template_event?: &(&1 == 3))
+    end
+
+    test "a render error" do
+      json = template_event(3, %{error: "UndefinedError: 'x' is undefined", level: "ERROR"})
+
+      assert {:template, 3, %{error: "UndefinedError: 'x' is undefined", level: "ERROR"}} =
+               Protocol.parse(json, template_event?: &(&1 == 3))
+    end
+
+    test "without template_event? a template event reads as an empty entities event" do
+      json = template_event(3, %{result: "x", listeners: %{}})
+      assert {:entities, 3, %{added: %{}, changed: %{}, removed: []}} = Protocol.parse(json)
+    end
+  end
+
   describe "parse/1 — other events" do
     test "non-state_changed event is passed through" do
       json =
@@ -288,6 +319,29 @@ defmodule Hassock.ProtocolTest do
       decoded = Protocol.encode_lovelace_config(5, "dashboard-energy", true) |> Jason.decode!()
       assert decoded["url_path"] == "dashboard-energy"
       assert decoded["force"] == true
+    end
+
+    test "encode_render_template/3 minimal" do
+      decoded = Protocol.encode_render_template(5, "{{ 1 }}") |> Jason.decode!()
+      assert decoded == %{"id" => 5, "type" => "render_template", "template" => "{{ 1 }}"}
+    end
+
+    test "encode_render_template/3 with options drops unknown ones" do
+      decoded =
+        Protocol.encode_render_template(5, "{{ x }}",
+          variables: %{x: 1},
+          timeout: 2.5,
+          strict: true,
+          report_errors: true,
+          bogus: 1
+        )
+        |> Jason.decode!()
+
+      assert decoded["variables"] == %{"x" => 1}
+      assert decoded["timeout"] == 2.5
+      assert decoded["strict"] == true
+      assert decoded["report_errors"] == true
+      refute Map.has_key?(decoded, "bogus")
     end
 
     test "encode_call_service/2 minimal" do
