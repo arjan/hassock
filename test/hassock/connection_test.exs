@@ -1,182 +1,339 @@
 defmodule Hassock.ConnectionTest do
   use ExUnit.Case, async: true
 
-  alias Hassock.Connection
-  alias Hassock.Connection.State
+  import Hassock.TestHelpers
+  alias Hassock.{Connection, EntityState, FakeHA, ServiceCall}
 
-  # handle_connect/2 runs in the connection process; these tests call it
-  # directly, so the test process plays the connection and `controller`
-  # plays the controlling process.
-  setup do
-    controller = spawn(fn -> Process.sleep(:infinity) end)
-    on_exit(fn -> Process.exit(controller, :kill) end)
-    %{controller: controller}
+  # Run a blocking call in a task and return the command HA received for it.
+  defp call_async(fun) do
+    task = Task.async(fun)
+    assert_receive {:fake_ha, _sock, %{"id" => _} = msg}, 1_000
+    {task, msg}
   end
 
-  defp monitors_of(pid) do
-    {:monitors, monitors} = Process.info(self(), :monitors)
-    Enum.count(monitors, &match?({:process, ^pid}, &1))
+  describe "command/4" do
+    setup do: connect()
+
+    test "returns an entity registry list as-is, not as states", %{conn: conn, sock: sock} do
+      entries = [%{"entity_id" => "light.kitchen", "platform" => "hue", "hidden_by" => nil}]
+
+      {task, msg} = call_async(fn -> Hassock.command(conn, "config/entity_registry/list") end)
+      assert %{"type" => "config/entity_registry/list", "id" => id} = msg
+
+      FakeHA.result(sock, id, entries)
+      assert Task.await(task) == {:ok, entries}
+    end
+
+    test "returns an empty list result", %{conn: conn, sock: sock} do
+      {task, %{"id" => id}} =
+        call_async(fn -> Hassock.command(conn, "config/label_registry/list") end)
+
+      FakeHA.result(sock, id, [])
+      assert Task.await(task) == {:ok, []}
+    end
+
+    test "merges the payload; id and type can't be overridden", %{conn: conn, sock: sock} do
+      {task, msg} =
+        call_async(fn ->
+          Hassock.command(conn, "render_template", %{:template => "x", "id" => 0, type: "nope"})
+        end)
+
+      assert %{"type" => "render_template", "template" => "x", "id" => id} = msg
+      assert id > 0
+      FakeHA.result(sock, id, nil)
+      assert Task.await(task) == {:ok, nil}
+    end
+
+    test "returns HA errors", %{conn: conn, sock: sock} do
+      {task, %{"id" => id}} = call_async(fn -> Hassock.command(conn, "bogus") end)
+      FakeHA.error(sock, id, "unknown_command", "Unknown command.")
+
+      assert Task.await(task) ==
+               {:error, %{"code" => "unknown_command", "message" => "Unknown command."}}
+    end
+
+    test "times out after :timeout", %{conn: conn} do
+      assert {:error, :timeout} = Hassock.command(conn, "slow", %{}, timeout: 50)
+    end
+
+    test "fails in-flight commands with :disconnected", %{conn: conn, sock: sock} do
+      {task, _msg} = call_async(fn -> Hassock.command(conn, "slow") end)
+      FakeHA.close(sock)
+      assert Task.await(task) == {:error, :disconnected}
+    end
   end
 
-  describe "handle_connect/2" do
-    test "monitors the controlling process on first connect", %{controller: controller} do
-      state = %State{controlling_pid: controller}
+  describe "fixed commands" do
+    setup do: connect()
 
-      assert {:ok, %State{controlling_monitor: ref}} = Connection.handle_connect(nil, state)
-      assert is_reference(ref)
-      assert monitors_of(controller) == 1
+    test "get_states decodes entity states", %{conn: conn, sock: sock} do
+      {task, %{"type" => "get_states", "id" => id}} =
+        call_async(fn -> Hassock.get_states(conn) end)
+
+      FakeHA.result(sock, id, [%{entity_id: "sun.sun", state: "above_horizon", attributes: %{}}])
+
+      assert {:ok, [%EntityState{entity_id: "sun.sun", state: "above_horizon"}]} =
+               Task.await(task)
     end
 
-    test "keeps the existing monitor on reconnect instead of stacking another",
-         %{controller: controller} do
-      {:ok, state} = Connection.handle_connect(nil, %State{controlling_pid: controller})
+    test "get_states reports a result that isn't a list", %{conn: conn, sock: sock} do
+      {task, %{"id" => id}} = call_async(fn -> Hassock.get_states(conn) end)
+      FakeHA.result(sock, id, %{"not" => "a list"})
+      assert Task.await(task) == {:error, {:unexpected_result, %{"not" => "a list"}}}
+      assert Hassock.connected?(conn)
+    end
 
-      assert {:ok, ^state} = Connection.handle_connect(nil, state)
-      assert {:ok, ^state} = Connection.handle_connect(nil, state)
-      assert monitors_of(controller) == 1
+    test "get_services reports a domain whose services aren't a map", %{conn: conn, sock: sock} do
+      {task, %{"id" => id}} = call_async(fn -> Hassock.get_services(conn) end)
+      FakeHA.result(sock, id, %{"light" => nil})
+      assert {:error, {:unexpected_result, %{"light" => nil}}} = Task.await(task)
+      assert Hassock.connected?(conn)
+    end
+
+    test "get_states reports entries without a string entity_id", %{conn: conn, sock: sock} do
+      {task, %{"id" => id}} = call_async(fn -> Hassock.get_states(conn) end)
+      FakeHA.result(sock, id, [%{"entity_id" => 123, "state" => "on"}])
+      assert {:error, {:unexpected_result, _}} = Task.await(task)
+      assert Hassock.connected?(conn)
+    end
+
+    test "get_states decodes an empty list", %{conn: conn, sock: sock} do
+      {task, %{"id" => id}} = call_async(fn -> Hassock.get_states(conn) end)
+      FakeHA.result(sock, id, [])
+      assert Task.await(task) == {:ok, []}
+    end
+
+    test "get_services decodes to sorted service names", %{conn: conn, sock: sock} do
+      {task, %{"type" => "get_services", "id" => id}} =
+        call_async(fn -> Hassock.get_services(conn) end)
+
+      FakeHA.result(sock, id, %{light: %{turn_on: %{}, toggle: %{}}})
+      assert Task.await(task) == {:ok, %{"light" => ["toggle", "turn_on"]}}
+    end
+
+    test "call_service sends return_response and returns the response", %{conn: conn, sock: sock} do
+      call = %ServiceCall{
+        domain: "weather",
+        service: "get_forecasts",
+        target: %{entity_id: "weather.home"},
+        service_data: %{type: "daily"},
+        return_response: true
+      }
+
+      {task, msg} = call_async(fn -> Hassock.call_service(conn, call) end)
+
+      assert %{
+               "type" => "call_service",
+               "domain" => "weather",
+               "service" => "get_forecasts",
+               "target" => %{"entity_id" => "weather.home"},
+               "service_data" => %{"type" => "daily"},
+               "return_response" => true,
+               "id" => id
+             } = msg
+
+      FakeHA.result(sock, id, %{context: %{id: "c"}, response: %{"weather.home" => %{}}})
+      assert {:ok, %{"response" => %{"weather.home" => %{}}}} = Task.await(task)
+    end
+
+    test "call_service omits return_response by default", %{conn: conn, sock: sock} do
+      call = %ServiceCall{domain: "light", service: "toggle"}
+      {task, msg} = call_async(fn -> Hassock.call_service(conn, call) end)
+      refute Map.has_key?(msg, "return_response")
+      FakeHA.result(sock, msg["id"], %{context: %{id: "c"}})
+      assert {:ok, %{"context" => _}} = Task.await(task)
     end
   end
 
-  describe "lovelace results" do
-    # Calls handle_frame/2 directly; the pending entry's reply target is an
-    # alias of the test process, so the reply lands in its mailbox.
-    defp pending_state(kind) do
-      ref = :erlang.alias()
-      {ref, %State{authenticated: true, pending: %{7 => {ref, kind}}, next_id: 8}}
-    end
+  describe "events" do
+    setup do: connect()
 
-    defp services_shaped_result(id) do
-      Jason.encode!(%{
-        type: "result",
-        id: id,
-        success: true,
-        result: %{strategy: %{options: %{areas: %{}}, type: "original-states"}}
+    test "registry update events arrive typed", %{conn: conn, sock: sock} do
+      {task, %{"id" => id, "event_type" => "area_registry_updated"}} =
+        call_async(fn -> Hassock.subscribe_events(conn, "area_registry_updated") end)
+
+      FakeHA.result(sock, id, nil)
+      assert {:ok, ^id} = Task.await(task)
+
+      FakeHA.event(sock, id, %{
+        event_type: "area_registry_updated",
+        data: %{action: "create", area_id: "porch"}
       })
+
+      assert_receive {:hassock, ^conn, {:event, {:registry_updated, :area, :create, "porch"}}}
     end
 
-    test "a services-shaped dashboard config reaches the caller unchanged" do
-      {ref, state} = pending_state(:lovelace_config)
-
-      assert {:ok, %State{pending: pending}} =
-               Connection.handle_frame({:text, services_shaped_result(7)}, state)
-
-      assert pending == %{}
-      assert_received {:hassock_response, ^ref, {:ok, %{"strategy" => _}}}
+    test "a malformed registry event doesn't disturb commands in flight",
+         %{conn: conn, sock: sock} do
+      {task, %{"id" => id}} = call_async(fn -> Hassock.command(conn, "get_config") end)
+      FakeHA.event(sock, 99, %{event_type: "area_registry_updated", data: 42})
+      FakeHA.result(sock, id, %{"version" => "2026.10.0"})
+      assert {:ok, %{"version" => _}} = Task.await(task)
     end
 
-    test "get_services keeps its shape detection" do
-      {ref, state} = pending_state(:get_services)
-      Connection.handle_frame({:text, services_shaped_result(7)}, state)
-      assert_received {:hassock_response, ^ref, {:ok, %{"strategy" => ["options", "type"]}}}
+    test "events of a subscription made with command/4 keep their body",
+         %{conn: conn, sock: sock} do
+      {task, %{"id" => id, "type" => "render_template"}} =
+        call_async(fn -> Hassock.command(conn, "render_template", %{template: "{{ 1 }}"}) end)
+
+      FakeHA.result(sock, id, nil)
+      assert Task.await(task) == {:ok, nil}
+
+      FakeHA.event(sock, id, %{result: "1", listeners: %{all: false}})
+      assert_receive {:hassock, ^conn, {:event, {:other, nil, %{"result" => "1"}}}}, 1_000
     end
 
-    test "a dashboard list is returned as maps" do
-      {ref, state} = pending_state(:lovelace_dashboards)
+    test "undecodable frames are dropped without crashing", %{conn: conn, sock: sock} do
+      FakeHA.push_raw(sock, "{not json")
+      {task, %{"id" => id}} = call_async(fn -> Hassock.command(conn, "get_config") end)
+      FakeHA.result(sock, id, %{"version" => "2026.10.0"})
+      assert {:ok, %{"version" => _}} = Task.await(task)
+      assert Hassock.connected?(conn)
+    end
+  end
 
-      json =
-        Jason.encode!(%{
-          type: "result",
-          id: 7,
-          success: true,
-          result: [%{id: "dashboard_energy", url_path: "dashboard-energy", mode: "storage"}]
-        })
+  describe "before auth" do
+    test "commands return :not_connected" do
+      ha = FakeHA.start(hold_auth: true)
+      on_exit(fn -> FakeHA.stop(ha) end)
+      {:ok, conn} = Connection.start_link(config: FakeHA.config(ha.port))
+      assert_receive {:fake_ha, _sock, :open}, 1_000
 
-      Connection.handle_frame({:text, json}, state)
+      assert Hassock.command(conn, "get_config") == {:error, :not_connected}
+      refute Hassock.connected?(conn)
+    end
 
-      assert_received {:hassock_response, ^ref,
-                       {:ok, [%{"url_path" => "dashboard-energy", "mode" => "storage"}]}}
+    test "a missing named connection returns an error instead of raising" do
+      assert {:error, {:connection_down, :noproc}} = Hassock.command(:no_such_conn, "get_config")
+    end
+  end
+
+  describe "lovelace" do
+    setup do: connect()
+
+    test "a services-shaped dashboard config reaches the caller unchanged",
+         %{conn: conn, sock: sock} do
+      config = %{"strategy" => %{"options" => %{"areas" => %{}}, "type" => "original-states"}}
+
+      {task, msg} = call_async(fn -> Hassock.lovelace_config(conn, "dashboard-energy") end)
+
+      assert %{"type" => "lovelace/config", "url_path" => "dashboard-energy", "force" => false} =
+               msg
+
+      FakeHA.result(sock, msg["id"], config)
+      assert Task.await(task) == {:ok, config}
+    end
+
+    test "a nil url_path asks for the default dashboard, with :force", %{conn: conn, sock: sock} do
+      {task, msg} = call_async(fn -> Hassock.lovelace_config(conn, nil, force: true) end)
+      assert %{"type" => "lovelace/config", "force" => true} = msg
+      refute Map.has_key?(msg, "url_path")
+      FakeHA.error(sock, msg["id"], "config_not_found", "No config found.")
+      assert {:error, %{"code" => "config_not_found"}} = Task.await(task)
+    end
+
+    test "a dashboard list is returned as maps", %{conn: conn, sock: sock} do
+      {task, %{"type" => "lovelace/dashboards/list", "id" => id}} =
+        call_async(fn -> Hassock.lovelace_dashboards(conn) end)
+
+      FakeHA.result(sock, id, [
+        %{id: "dashboard_energy", url_path: "dashboard-energy", mode: "storage"}
+      ])
+
+      assert {:ok, [%{"url_path" => "dashboard-energy", "mode" => "storage"}]} = Task.await(task)
     end
   end
 
   describe "template subscriptions" do
-    defp frame(map), do: {:text, Jason.encode!(map)}
+    setup do: connect()
 
-    defp subscribed_state do
-      ref = :erlang.alias()
+    test "sends the template and its options, and routes its events",
+         %{conn: conn, sock: sock} do
+      {id, msg} =
+        subscribe(conn, sock, fn c ->
+          Hassock.subscribe_template(c, "{{ x }}",
+            variables: %{x: 1},
+            render_timeout: 3,
+            report_errors: true
+          )
+        end)
 
-      state = %State{
-        authenticated: true,
-        controlling_pid: self(),
-        pending: %{4 => {ref, :subscribe_template}},
-        next_id: 5
-      }
+      assert %{
+               "type" => "render_template",
+               "template" => "{{ x }}",
+               "variables" => %{"x" => 1},
+               "timeout" => 3,
+               "report_errors" => true
+             } = msg
 
-      {:ok, state} =
-        Connection.handle_frame(
-          frame(%{type: "result", id: 4, success: true, result: nil}),
-          state
-        )
-
-      assert_received {:hassock_response, ^ref, {:ok, 4}}
-      state
+      FakeHA.event(sock, id, %{result: "Aan", listeners: %{all: false}})
+      assert_receive {:hassock, ^conn, {:event, {:template, ^id, %{result: "Aan"}}}}, 1_000
     end
 
-    test "a successful subscribe tracks the id and routes its events" do
-      state = subscribed_state()
-      assert MapSet.member?(state.templates, 4)
+    test "an error event before the subscribe result is still a template event",
+         %{conn: conn, sock: sock} do
+      {task, %{"id" => id}} =
+        call_async(fn -> Hassock.subscribe_template(conn, "{{ x }}", report_errors: true) end)
 
-      event = frame(%{type: "event", id: 4, event: %{result: "Aan", listeners: %{}}})
-      Connection.handle_frame(event, state)
+      FakeHA.event(sock, id, %{error: "boom", level: "WARNING"})
+      FakeHA.result(sock, id, nil)
+      assert {:ok, ^id} = Task.await(task)
 
-      assert_received {:hassock, _, {:event, {:template, 4, %{result: "Aan"}}}}
+      assert_receive {:hassock, ^conn,
+                      {:event, {:template, ^id, %{error: "boom", level: "WARNING"}}}},
+                     1_000
     end
 
-    test "an error event before the subscribe result is still a template event" do
-      ref = :erlang.alias()
-
-      state = %State{
-        authenticated: true,
-        controlling_pid: self(),
-        pending: %{4 => {ref, :subscribe_template}}
-      }
-
-      event = frame(%{type: "event", id: 4, event: %{error: "boom", level: "WARNING"}})
-      Connection.handle_frame(event, state)
-
-      assert_received {:hassock, _, {:event, {:template, 4, %{error: "boom", level: "WARNING"}}}}
+    test "a failed subscribe returns HA's error", %{conn: conn, sock: sock} do
+      {task, %{"id" => id}} = call_async(fn -> Hassock.subscribe_template(conn, "{{") end)
+      FakeHA.error(sock, id, "template_error", "bad")
+      assert {:error, %{"code" => "template_error"}} = Task.await(task)
     end
 
-    test "a failed subscribe is not tracked" do
-      ref = :erlang.alias()
-      state = %State{authenticated: true, pending: %{4 => {ref, :subscribe_template}}}
+    test "unsubscribing drops its in-flight events", %{conn: conn, sock: sock} do
+      {id, _msg} = subscribe(conn, sock, &Hassock.subscribe_template(&1, "{{ 1 }}"))
 
-      result =
-        frame(%{
-          type: "result",
-          id: 4,
-          success: false,
-          error: %{code: "template_error", message: "bad"}
-        })
+      task = Task.async(fn -> Hassock.unsubscribe_events(conn, id) end)
+      assert_receive {:fake_ha, ^sock, %{"type" => "unsubscribe_events", "id" => unsub_id}}, 1_000
+      FakeHA.event(sock, id, %{result: "1", listeners: %{}})
+      FakeHA.result(sock, unsub_id, nil)
+      assert Task.await(task) == :ok
 
-      {:ok, state} = Connection.handle_frame(result, state)
-
-      assert MapSet.size(state.templates) == 0
-      assert_received {:hassock_response, ^ref, {:error, %{"code" => "template_error"}}}
+      refute_receive {:hassock, ^conn, {:event, _}}, 100
     end
 
-    test "unsubscribing stops tracking the id" do
-      state = subscribed_state()
-      ref = :erlang.alias()
-      state = %{state | pending: %{5 => {ref, {:unsubscribe, 4}}}}
+    test "a template subscription is restored after a reconnect, with the same id",
+         %{conn: conn, sock: sock} do
+      {id, _msg} = subscribe(conn, sock, &Hassock.subscribe_template(&1, "{{ 1 }}"))
 
-      {:ok, state} =
-        Connection.handle_frame(
-          frame(%{type: "result", id: 5, success: true, result: nil}),
-          state
-        )
+      FakeHA.close(sock)
+      assert_receive {:hassock, ^conn, {:disconnected, _}}, 1_000
+      sock2 = await_auth(conn)
 
-      assert_received {:hassock_response, ^ref, :ok}
-      refute MapSet.member?(state.templates, 4)
+      assert_receive {:fake_ha, ^sock2,
+                      %{"type" => "render_template", "template" => "{{ 1 }}", "id" => ha_id}},
+                     1_000
+
+      FakeHA.result(sock2, ha_id, nil)
+      FakeHA.event(sock2, ha_id, %{result: "1", listeners: %{}})
+      assert_receive {:hassock, ^conn, {:event, {:template, ^id, %{result: "1"}}}}, 1_000
     end
 
-    test "a disconnect forgets template subscriptions" do
-      state = subscribed_state()
+    test ":to delivers template events to another process", %{conn: conn, sock: sock} do
+      parent = self()
 
-      assert {:reconnect, %State{templates: templates}} =
-               Connection.handle_disconnect(%{reason: :closed}, state)
+      receiver =
+        spawn_link(fn ->
+          receive do
+            msg -> send(parent, {:receiver_got, msg})
+          end
+        end)
 
-      assert MapSet.size(templates) == 0
-      assert_received {:hassock, _, {:disconnected, :closed}}
+      {id, _msg} = subscribe(conn, sock, &Hassock.subscribe_template(&1, "{{ 1 }}", to: receiver))
+      FakeHA.event(sock, id, %{result: "1", listeners: %{}})
+
+      assert_receive {:receiver_got, {:hassock, ^conn, {:event, {:template, ^id, _}}}}, 1_000
+      refute_received {:hassock, ^conn, {:event, _}}
     end
   end
 end

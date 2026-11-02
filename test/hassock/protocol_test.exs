@@ -163,93 +163,214 @@ defmodule Hassock.ProtocolTest do
                Protocol.parse(~s({"type": "result", "id": 3, "success": true, "result": null}))
     end
 
-    test "failure result" do
-      json = Jason.encode!(%{type: "result", id: 4, success: false, result: nil})
-      assert {:result, 4, false, nil} = Protocol.parse(json)
+    test "failure result carries the error map" do
+      error = %{"code" => "not_found", "message" => "Entity not found."}
+      json = Jason.encode!(%{type: "result", id: 4, success: false, error: error})
+      assert {:result, 4, false, ^error} = Protocol.parse(json)
     end
 
-    test "get_states result becomes :states" do
+    test "list results stay raw, even when every item has an entity_id" do
+      entries = [%{"entity_id" => "light.a", "platform" => "hue"}]
+      json = Jason.encode!(%{type: "result", id: 2, success: true, result: entries})
+      assert {:result, 2, true, ^entries} = Protocol.parse(json)
+    end
+
+    test "map results stay raw, even when shaped like get_services" do
+      services = %{"light" => %{"turn_on" => %{}}}
+      json = Jason.encode!(%{type: "result", id: 3, success: true, result: services})
+      assert {:result, 3, true, ^services} = Protocol.parse(json)
+    end
+
+    test "empty list result" do
+      assert {:result, 4, true, []} =
+               Protocol.parse(~s({"type": "result", "id": 4, "success": true, "result": []}))
+    end
+  end
+
+  describe "decode_states/1 and decode_services/1" do
+    test "decode_states/1 builds EntityState structs" do
+      states = [
+        %{"entity_id" => "light.a", "state" => "on", "attributes" => %{"b" => 1}},
+        %{"entity_id" => "switch.b", "state" => "off"}
+      ]
+
+      assert [
+               %EntityState{entity_id: "light.a", state: "on", attributes: %{"b" => 1}},
+               %EntityState{entity_id: "switch.b", state: "off", attributes: %{}}
+             ] = Protocol.decode_states(states)
+    end
+
+    test "decode_services/1 lists sorted service names per domain" do
+      result = %{"light" => %{"turn_on" => %{}, "toggle" => %{}}, "scene" => %{}}
+
+      assert Protocol.decode_services(result) == %{
+               "light" => ["toggle", "turn_on"],
+               "scene" => []
+             }
+    end
+  end
+
+  describe "parse/1 — bad input" do
+    test "invalid JSON returns {:invalid, error} instead of raising" do
+      assert {:invalid, %Jason.DecodeError{}} = Protocol.parse("{not json")
+    end
+
+    test "valid JSON that isn't an object is unknown" do
+      assert {:unknown, [1, 2]} = Protocol.parse("[1, 2]")
+    end
+  end
+
+  describe "parse/1 — pong and removals" do
+    test "pong keeps its id" do
+      assert {:pong, 5} = Protocol.parse(~s({"id": 5, "type": "pong"}))
+    end
+
+    test "state_changed for a removed entity has a nil new_state" do
       json =
         Jason.encode!(%{
-          type: "result",
+          type: "event",
           id: 2,
-          success: true,
-          result: [
-            %{entity_id: "light.a", state: "on", attributes: %{}},
-            %{entity_id: "switch.b", state: "off", attributes: %{}}
-          ]
+          event: %{
+            event_type: "state_changed",
+            data: %{entity_id: "light.gone", new_state: nil, old_state: %{state: "on"}}
+          }
         })
 
-      assert {:states, 2, states} = Protocol.parse(json)
-      assert length(states) == 2
-      assert %EntityState{entity_id: "light.a", state: "on"} = hd(states)
+      assert {:state_changed, 2, nil, %EntityState{entity_id: "light.gone", state: "on"}} =
+               Protocol.parse(json)
     end
   end
 
-  describe "parse/2 — raw results" do
-    # A strategy dashboard config has the shape of a get_services result:
-    # a map whose first value is a map whose first value is a map.
-    @strategy_config %{strategy: %{options: %{areas: %{}}, type: "original-states"}}
-
-    test "shape detection misreads a strategy dashboard config as services" do
-      json = Jason.encode!(%{type: "result", id: 7, success: true, result: @strategy_config})
-      assert {:services, 7, _} = Protocol.parse(json)
-    end
-
-    test "raw_result? returns the config untouched" do
-      json = Jason.encode!(%{type: "result", id: 7, success: true, result: @strategy_config})
-
-      assert {:result, 7, true, %{"strategy" => %{"type" => "original-states"}}} =
-               Protocol.parse(json, raw_result?: &(&1 == 7))
-    end
-
-    test "raw_result? passes errors through" do
+  describe "parse/1 — events without an event_type" do
+    test "a render_template event is passed through whole, not as an entities update" do
       json =
         Jason.encode!(%{
-          type: "result",
-          id: 8,
-          success: false,
-          error: %{code: "config_not_found", message: "No config found."}
+          type: "event",
+          id: 4,
+          event: %{result: "21 °C", listeners: %{all: false, entities: ["sensor.t"]}}
         })
 
-      assert {:result, 8, false, %{"code" => "config_not_found"}} =
-               Protocol.parse(json, raw_result?: fn _ -> true end)
-    end
-
-    test "raw_result? only applies to matching ids" do
-      json = Jason.encode!(%{type: "result", id: 9, success: true, result: @strategy_config})
-      assert {:services, 9, _} = Protocol.parse(json, raw_result?: &(&1 == 7))
+      assert {:event, 4, nil, %{"result" => "21 °C", "listeners" => _}} = Protocol.parse(json)
     end
   end
 
-  describe "parse/2 — template events" do
-    defp template_event(id, event),
-      do: Jason.encode!(%{type: "event", id: id, event: event})
+  describe "parse/1 — malformed fields" do
+    defp event(event), do: Jason.encode!(%{type: "event", id: 3, event: event})
 
-    test "a render result" do
+    test "a registry event whose data isn't a map is passed through as a plain event" do
+      assert {:event, 3, "area_registry_updated", _} =
+               Protocol.parse(event(%{event_type: "area_registry_updated", data: 42}))
+    end
+
+    test "a state_changed event whose new_state isn't a map is passed through" do
+      json = event(%{event_type: "state_changed", data: %{entity_id: "x.y", new_state: 5}})
+      assert {:event, 3, "state_changed", _} = Protocol.parse(json)
+    end
+
+    test "a state_changed event with a malformed old_state keeps old_state nil" do
       json =
-        template_event(3, %{result: "💻 **Aan** sinds 14:05", listeners: %{entities: ["a.b"]}})
+        event(%{
+          event_type: "state_changed",
+          data: %{entity_id: "x.y", new_state: %{state: "on"}, old_state: 5}
+        })
 
-      assert {:template, 3,
-              %{result: "💻 **Aan** sinds 14:05", listeners: %{"entities" => ["a.b"]}}} =
-               Protocol.parse(json, template_event?: &(&1 == 3))
+      assert {:state_changed, 3, %EntityState{state: "on"}, nil} = Protocol.parse(json)
+    end
+
+    test "entities events drop fields of the wrong type" do
+      assert {:entities, 3, %{added: %{}, changed: %{}, removed: []}} =
+               Protocol.parse(event(%{a: 5, c: "x", r: 7}))
+
+      assert {:entities, 3, %{added: added, changed: changed, removed: ["light.b"]}} =
+               Protocol.parse(
+                 event(%{
+                   a: %{"light.bad" => 5, "light.ok" => %{s: "on", a: 9}},
+                   c: %{"light.bad" => 5, "light.c" => %{"+" => %{s: "off", a: 1}, "-" => 3}},
+                   r: ["light.b", 4]
+                 })
+               )
+
+      assert %{"light.ok" => %EntityState{state: "on", attributes: %{}}} = added
+      assert %{"light.c" => %{added: %{state: "off"}, removed: %{}}} = changed
+    end
+  end
+
+  describe "parse/1 — registry events" do
+    for {type, kind, key} <- [
+          {"floor_registry_updated", :floor, "floor_id"},
+          {"area_registry_updated", :area, "area_id"},
+          {"device_registry_updated", :device, "device_id"},
+          {"entity_registry_updated", :entity, "entity_id"},
+          {"label_registry_updated", :label, "label_id"}
+        ] do
+      test "#{type} becomes :registry_updated" do
+        json =
+          Jason.encode!(%{
+            type: "event",
+            id: 9,
+            event: %{
+              event_type: unquote(type),
+              data: %{"action" => "update", unquote(key) => "x"}
+            }
+          })
+
+        assert {:registry_updated, 9, unquote(kind), :update, "x"} = Protocol.parse(json)
+      end
+    end
+
+    test "actions map to atoms; unknown actions stay strings" do
+      parse = fn action ->
+        %{
+          type: "event",
+          id: 1,
+          event: %{event_type: "area_registry_updated", data: %{action: action, area_id: "a"}}
+        }
+        |> Jason.encode!()
+        |> Protocol.parse()
+      end
+
+      assert {:registry_updated, 1, :area, :create, "a"} = parse.("create")
+      assert {:registry_updated, 1, :area, :remove, "a"} = parse.("remove")
+      assert {:registry_updated, 1, :area, "reorder", "a"} = parse.("reorder")
+    end
+
+    test "registry_event_types/0 lists the five types" do
+      assert Enum.sort(Protocol.registry_event_types()) == [
+               "area_registry_updated",
+               "device_registry_updated",
+               "entity_registry_updated",
+               "floor_registry_updated",
+               "label_registry_updated"
+             ]
+    end
+  end
+
+  describe "decode_template_event/1" do
+    test "a render result" do
+      event = %{"result" => "💻 **Aan** sinds 14:05", "listeners" => %{"entities" => ["a.b"]}}
+
+      assert Protocol.decode_template_event(event) ==
+               %{result: "💻 **Aan** sinds 14:05", listeners: %{"entities" => ["a.b"]}}
     end
 
     test "a non-string result keeps its type" do
-      json = template_event(3, %{result: 21.5, listeners: %{}})
-      assert {:template, 3, %{result: 21.5}} = Protocol.parse(json, template_event?: &(&1 == 3))
+      assert %{result: 21.5} = Protocol.decode_template_event(%{"result" => 21.5})
     end
 
     test "a render error" do
-      json = template_event(3, %{error: "UndefinedError: 'x' is undefined", level: "ERROR"})
+      event = %{"error" => "UndefinedError: 'x' is undefined", "level" => "ERROR"}
 
-      assert {:template, 3, %{error: "UndefinedError: 'x' is undefined", level: "ERROR"}} =
-               Protocol.parse(json, template_event?: &(&1 == 3))
+      assert Protocol.decode_template_event(event) ==
+               %{error: "UndefinedError: 'x' is undefined", level: "ERROR"}
     end
 
-    test "without template_event? a template event reads as an empty entities event" do
-      json = template_event(3, %{result: "x", listeners: %{}})
-      assert {:entities, 3, %{added: %{}, changed: %{}, removed: []}} = Protocol.parse(json)
+    test "missing or malformed listeners and level get defaults" do
+      assert %{listeners: %{}} = Protocol.decode_template_event(%{"result" => "x"})
+
+      assert %{listeners: %{}} =
+               Protocol.decode_template_event(%{"result" => "x", "listeners" => 1})
+
+      assert %{level: "ERROR"} = Protocol.decode_template_event(%{"error" => "boom"})
     end
   end
 
@@ -300,6 +421,21 @@ defmodule Hassock.ProtocolTest do
       assert decoded["subscription"] == 99
     end
 
+    test "encode_command/3 merges the payload under id and type" do
+      decoded =
+        Protocol.encode_command(6, "config/area_registry/list", %{:a => 1, "id" => 0})
+        |> Jason.decode!()
+
+      assert decoded == %{"id" => 6, "type" => "config/area_registry/list", "a" => 1}
+    end
+
+    test "encode_call_service/2 with return_response" do
+      call = %ServiceCall{domain: "weather", service: "get_forecasts", return_response: true}
+
+      assert %{"return_response" => true} =
+               Protocol.encode_call_service(1, call) |> Jason.decode!()
+    end
+
     test "encode_get_states/1" do
       assert %{"id" => 5, "type" => "get_states"} =
                Protocol.encode_get_states(5) |> Jason.decode!()
@@ -330,9 +466,11 @@ defmodule Hassock.ProtocolTest do
       decoded =
         Protocol.encode_render_template(5, "{{ x }}",
           variables: %{x: 1},
-          timeout: 2.5,
+          render_timeout: 2.5,
           strict: true,
           report_errors: true,
+          timeout: 10_000,
+          to: self(),
           bogus: 1
         )
         |> Jason.decode!()
@@ -342,6 +480,7 @@ defmodule Hassock.ProtocolTest do
       assert decoded["strict"] == true
       assert decoded["report_errors"] == true
       refute Map.has_key?(decoded, "bogus")
+      refute Map.has_key?(decoded, "to")
     end
 
     test "encode_call_service/2 minimal" do
