@@ -11,6 +11,20 @@ defmodule Hassock.ConnectionTest do
     {task, msg}
   end
 
+  # A process that forwards everything it receives to the test.
+  defp forwarder do
+    test = self()
+    spawn_link(fn -> forward(test) end)
+  end
+
+  defp forward(test) do
+    receive do
+      msg -> send(test, {:forwarded, msg})
+    end
+
+    forward(test)
+  end
+
   describe "command/4" do
     setup do: connect()
 
@@ -200,6 +214,9 @@ defmodule Hassock.ConnectionTest do
       assert_receive {:fake_ha, _sock, :open}, 1_000
 
       assert Hassock.command(conn, "get_config") == {:error, :not_connected}
+      assert Hassock.lovelace_dashboards(conn) == {:error, :not_connected}
+      assert Hassock.lovelace_config(conn, nil) == {:error, :not_connected}
+      assert Hassock.subscribe_template(conn, "{{ 1 }}") == {:error, :not_connected}
       refute Hassock.connected?(conn)
     end
 
@@ -211,7 +228,7 @@ defmodule Hassock.ConnectionTest do
   describe "lovelace" do
     setup do: connect()
 
-    test "a services-shaped dashboard config reaches the caller unchanged",
+    test "a strategy config shaped like get_services reaches the caller unchanged",
          %{conn: conn, sock: sock} do
       config = %{"strategy" => %{"options" => %{"areas" => %{}}, "type" => "original-states"}}
 
@@ -241,6 +258,12 @@ defmodule Hassock.ConnectionTest do
       ])
 
       assert {:ok, [%{"url_path" => "dashboard-energy", "mode" => "storage"}]} = Task.await(task)
+    end
+
+    test ":timeout bounds the wait", %{conn: conn} do
+      assert Hassock.lovelace_dashboards(conn, timeout: 50) == {:error, :timeout}
+      assert Hassock.lovelace_config(conn, nil, timeout: 50) == {:error, :timeout}
+      assert Hassock.connected?(conn)
     end
   end
 
@@ -320,20 +343,78 @@ defmodule Hassock.ConnectionTest do
     end
 
     test ":to delivers template events to another process", %{conn: conn, sock: sock} do
-      parent = self()
-
-      receiver =
-        spawn_link(fn ->
-          receive do
-            msg -> send(parent, {:receiver_got, msg})
-          end
-        end)
-
+      receiver = forwarder()
       {id, _msg} = subscribe(conn, sock, &Hassock.subscribe_template(&1, "{{ 1 }}", to: receiver))
       FakeHA.event(sock, id, %{result: "1", listeners: %{}})
+      FakeHA.event(sock, id, %{result: "2", listeners: %{}})
 
-      assert_receive {:receiver_got, {:hassock, ^conn, {:event, {:template, ^id, _}}}}, 1_000
+      assert_receive {:forwarded, {:hassock, ^conn, {:event, {:template, ^id, %{result: "1"}}}}},
+                     1_000
+
+      assert_receive {:forwarded, {:hassock, ^conn, {:event, {:template, ^id, %{result: "2"}}}}},
+                     1_000
+
       refute_received {:hassock, ^conn, {:event, _}}
+    end
+
+    test "a payload that can't be encoded raises in the caller, not the connection",
+         %{conn: conn} do
+      assert_raise Protocol.UndefinedError, fn ->
+        Hassock.subscribe_template(conn, "{{ x }}", variables: %{x: {:a, :tuple}})
+      end
+
+      assert Hassock.connected?(conn)
+    end
+
+    test "events of a subscribe whose caller timed out are dropped", %{conn: conn, sock: sock} do
+      task = Task.async(fn -> Hassock.subscribe_template(conn, "{{ 1 }}", timeout: 50) end)
+      assert_receive {:fake_ha, ^sock, %{"type" => "render_template", "id" => id}}, 1_000
+      assert Task.await(task) == {:error, :timeout}
+
+      FakeHA.event(sock, id, %{result: "1", listeners: %{}})
+      FakeHA.result(sock, id, nil)
+
+      assert_receive {:fake_ha, ^sock, %{"type" => "unsubscribe_events", "subscription" => ^id}},
+                     1_000
+
+      refute_received {:hassock, ^conn, {:event, _}}
+    end
+
+    test "an event before the subscribe result goes to the :to receiver",
+         %{conn: conn, sock: sock} do
+      receiver = forwarder()
+
+      task =
+        Task.async(fn ->
+          Hassock.subscribe_template(conn, "{{ x }}", to: receiver, report_errors: true)
+        end)
+
+      assert_receive {:fake_ha, ^sock, %{"type" => "render_template", "id" => id}}, 1_000
+      FakeHA.event(sock, id, %{error: "boom", level: "ERROR"})
+      FakeHA.result(sock, id, nil)
+      assert {:ok, ^id} = Task.await(task)
+
+      assert_receive {:forwarded,
+                      {:hassock, ^conn, {:event, {:template, ^id, %{error: "boom"}}}}},
+                     1_000
+
+      refute_received {:hassock, ^conn, {:event, _}}
+    end
+
+    test "a :to receiver that exits cancels its template subscription",
+         %{conn: conn, sock: sock} do
+      receiver = forwarder()
+      {id, _msg} = subscribe(conn, sock, &Hassock.subscribe_template(&1, "{{ 1 }}", to: receiver))
+
+      Process.unlink(receiver)
+      Process.exit(receiver, :kill)
+
+      assert_receive {:fake_ha, ^sock, %{"type" => "unsubscribe_events", "subscription" => ^id}},
+                     1_000
+    end
+
+    test ":to must be a pid", %{conn: conn} do
+      assert_raise ArgumentError, fn -> Hassock.subscribe_template(conn, "{{ 1 }}", to: :nope) end
     end
   end
 end

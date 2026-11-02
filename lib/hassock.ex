@@ -83,7 +83,7 @@ defmodule Hassock do
   defdelegate connected?(conn), to: Connection
 
   @doc "List Lovelace (card-based) dashboards; built-in panels are not included."
-  defdelegate lovelace_dashboards(conn), to: Connection
+  defdelegate lovelace_dashboards(conn, opts \\ []), to: Connection
 
   @doc "Fetch a Lovelace dashboard config; `nil` url_path is the default dashboard."
   defdelegate lovelace_config(conn, url_path, opts \\ []), to: Connection

@@ -240,7 +240,13 @@ defmodule Hassock.Connection do
     * `:strict` - make undefined variables an error
     * `:report_errors` - send render errors as events instead of only logging
       them in HA
-    * `:to` and `:timeout`, as for `subscribe_entities/3`
+    * `:to` and `:timeout`, as for `subscribe_entities/3`; `:timeout` is the
+      ms to wait for HA's answer, not the render timeout
+
+  HA can send an error event before it answers the subscribe, so with
+  `report_errors: true` the receiver may get a template event before the
+  caller gets `{:ok, subscription_id}`; the event carries that id. If the
+  subscribe then fails, no further events follow.
 
   A `Hassock.Cache` drops template events it receives as controller; to use
   a template beside a cache, subscribe with `to: self()`.
@@ -299,10 +305,11 @@ defmodule Hassock.Connection do
 
   Recent HA versions list the default dashboard as `"lovelace"`; older ones
   and YAML setups may leave it out. `lovelace_config(conn, nil)` fetches it
-  either way.
+  either way. Options: `:timeout` in ms (default 10 s).
   """
-  @spec lovelace_dashboards(GenServer.server()) :: {:ok, [map]} | {:error, command_error}
-  def lovelace_dashboards(conn), do: request(conn, "lovelace/dashboards/list", %{}, :raw, [])
+  @spec lovelace_dashboards(GenServer.server(), keyword) :: {:ok, [map]} | {:error, command_error}
+  def lovelace_dashboards(conn, opts \\ []),
+    do: request(conn, "lovelace/dashboards/list", %{}, :raw, opts)
 
   @doc """
   Fetch the config (views and cards) of one dashboard.
@@ -346,6 +353,9 @@ defmodule Hassock.Connection do
 
   defp request(conn, type, payload, kind, opts) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
+    # Raise in the caller on a payload that can't be encoded (such as a
+    # tuple in :variables), not later in the connection every client shares.
+    _ = Protocol.encode_command(0, type, payload)
     sync_request(conn, {:command, type, payload, kind, timeout}, timeout)
   end
 
@@ -995,6 +1005,10 @@ defmodule Hassock.Connection do
       match?({_ref, {:subscribe, _, _, _, _, _}, _timer}, state.pending[ha_id]) ->
         {_ref, {:subscribe, _kind, subscriber, _, _, _}, _timer} = state.pending[ha_id]
         deliver_to(state, subscriber, payload)
+
+      # Its caller gave up: the subscription is cancelled once HA answers.
+      match?({nil, {:cancelled, {:subscribe, _, _, _, _, _}}, _timer}, state.pending[ha_id]) ->
+        :ok
 
       true ->
         notify(state, payload)

@@ -457,6 +457,16 @@ defmodule Hassock.ProtocolTest do
       assert decoded["force"] == true
     end
 
+    test "lovelace_config_payload/2 and render_template_payload/2 leave out id and type" do
+      assert Protocol.lovelace_config_payload("kitchen", false) ==
+               %{"url_path" => "kitchen", "force" => false}
+
+      assert Protocol.lovelace_config_payload(nil, true) == %{"force" => true}
+
+      assert Protocol.render_template_payload("{{ 1 }}", render_timeout: 2, strict: false) ==
+               %{"template" => "{{ 1 }}", "timeout" => 2, "strict" => false}
+    end
+
     test "encode_render_template/3 minimal" do
       decoded = Protocol.encode_render_template(5, "{{ 1 }}") |> Jason.decode!()
       assert decoded == %{"id" => 5, "type" => "render_template", "template" => "{{ 1 }}"}

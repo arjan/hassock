@@ -68,5 +68,15 @@ defmodule Hassock.EntityStateTest do
       assert new.attributes["x"] == 1
       refute Map.has_key?(new.attributes, "stale")
     end
+
+    test "a diff without :removed only merges" do
+      assert %EntityState{state: "5", attributes: %{"stale" => true}} =
+               EntityState.apply_diff(@current, %{added: %{state: "5"}})
+    end
+
+    test "removing an attribute that isn't there is a no-op" do
+      assert EntityState.apply_diff(@current, %{added: %{}, removed: %{attributes: ["nope"]}}) ==
+               @current
+    end
   end
 end
